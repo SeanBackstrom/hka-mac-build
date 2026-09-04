@@ -25,6 +25,17 @@ on:
         description: Upload the DMG and its receipt to private S3.
         type: boolean
         default: true
+      local_video_understanding:
+        description: >-
+          Whether the local Qwen3-VL and Gemma 4 E4B inference gates must pass.
+          Hosted runners have about 7 GB of memory, far below what those models
+          need, so best-effort reports their outcome as a limitation.
+        type: choice
+        options:
+          - best-effort
+          - required
+          - skip
+        default: best-effort
 
 permissions:
   contents: read
@@ -363,6 +374,7 @@ jobs:
             --media-root "${GITHUB_WORKSPACE}/dist/HKA-Desktop-macOS-arm64-Offline-Media"
             --expected-arch arm64
             --repo-root "${GITHUB_WORKSPACE}"
+            --local-video-understanding "${{ inputs.local_video_understanding }}"
           )
           if [ -n "${HKA_CI_TOGETHER_API_KEY:-}" ]; then
             echo "Live-provider smoke enabled for this macOS installed-runtime gate."
