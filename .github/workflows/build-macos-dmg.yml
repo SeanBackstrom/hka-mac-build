@@ -1,0 +1,574 @@
+# ============================================================================
+#  Build the HKA Desktop macOS one-DMG release on a free hosted Apple Silicon
+#  runner. This repository is public only so that the runner is free; it holds
+#  no application source, model bytes, or release artifacts. The private source
+#  is checked out with a repository secret at run time, the model custody is
+#  downloaded from the private repository's prerelease, and the verified DMG is
+#  streamed straight to private S3 with short-lived GitHub OIDC credentials.
+#  Nothing is uploaded as a public artifact.
+# ============================================================================
+
+name: Build macOS DMG
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact 40-hex commit of the private source to build.
+        type: string
+        required: true
+      run_verifier:
+        description: Run the installed-runtime verification before publishing.
+        type: boolean
+        default: true
+      publish:
+        description: Upload the DMG and its receipt to private S3.
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-macos-dmg
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: '3.12'
+  SOURCE_REPOSITORY: SeanBackstrom/hkaa-ai
+  SOURCE_SHA: ${{ inputs.source_sha }}
+  HKA_CI_OFFLINE_BUNDLE_RELEASE_TAG: hka-model-custody-v10
+  HKA_CI_OFFLINE_BUNDLE_INDEX_NAME: hka-offline-model-bundle.json
+  HKA_CI_OFFLINE_BUNDLE_INDEX_SHA256: 37ff23fdfba4134f535ae178b57201ee6281ced9b363877f65e8d237f4161b93
+  HKA_CI_OFFLINE_BUNDLE_FILE_COUNT: '22'
+  HKA_CI_OFFLINE_BUNDLE_PACK_COUNT: '9'
+  HKA_CI_OFFLINE_BUNDLE_MODEL_BYTES: '12147240319'
+  HKA_RELEASE_AWS_ACCOUNT_ID: ${{ vars.HKA_RELEASE_AWS_ACCOUNT_ID }}
+  HKA_RELEASE_AWS_REGION: ${{ vars.HKA_RELEASE_AWS_REGION }}
+  HKA_RELEASE_AWS_ROLE_ARN: ${{ vars.HKA_RELEASE_AWS_ROLE_ARN }}
+  HKA_RELEASE_S3_BUCKET: ${{ vars.HKA_RELEASE_S3_BUCKET }}
+
+jobs:
+  macos:
+    name: macOS arm64 (one embedded-model DMG)
+    runs-on: macos-15
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Validate inputs and deployment coordinates
+        run: |
+          set -euo pipefail
+          [[ "${SOURCE_SHA}" =~ ^[0-9a-f]{40}$ ]] || {
+            echo '::error::source_sha must be one exact 40-hex commit' >&2
+            exit 1
+          }
+          for name in HKA_RELEASE_AWS_ACCOUNT_ID HKA_RELEASE_AWS_REGION HKA_RELEASE_AWS_ROLE_ARN HKA_RELEASE_S3_BUCKET; do
+            [ -n "${!name}" ] || { echo "::error::repository variable ${name} is not set" >&2; exit 1; }
+          done
+
+      - name: Check out the private source at the exact commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: SeanBackstrom/hkaa-ai
+          ref: ${{ inputs.source_sha }}
+          token: ${{ secrets.HKA_SOURCE_TOKEN }}
+          persist-credentials: false
+
+      - id: source
+        name: Confirm the commit and read the application version
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${SOURCE_SHA}" || {
+            echo '::error::checked-out commit does not match source_sha' >&2
+            exit 1
+          }
+          git log -1 --format='%h %s'
+          APP_VERSION="$(python3 - <<'PY'
+          import ast, pathlib
+          tree = ast.parse(pathlib.Path("hkadesktop/__init__.py").read_text(encoding="utf-8"))
+          values = {
+              target.id: node.value.value
+              for node in tree.body
+              if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant)
+              for target in node.targets
+              if isinstance(target, ast.Name)
+          }
+          print(values["APP_VERSION"])
+          PY
+          )"
+          [[ "${APP_VERSION}" =~ ^[0-9A-Za-z][0-9A-Za-z._+-]*$ ]] || {
+            echo '::error::application version is invalid' >&2
+            exit 1
+          }
+          echo "app_version=${APP_VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "Building HKA Desktop ${APP_VERSION} from ${SOURCE_SHA}"
+
+      - name: Reclaim only ephemeral hosted-runner developer caches
+        run: |
+          set -euo pipefail
+          test "${RUNNER_ENVIRONMENT:-}" = "github-hosted" || {
+            echo 'FAIL: image-cache reclaim is allowed only on a GitHub-hosted ephemeral runner' >&2
+            exit 1
+          }
+          test "$(uname -s)" = Darwin && test "$(uname -m)" = arm64 || {
+            echo 'FAIL: developer-cache reclaim requires Apple Silicon macOS' >&2
+            exit 1
+          }
+          active_developer="$(xcode-select -p)"
+          case "${active_developer}" in
+            /Applications/Xcode*.app/Contents/Developer) ;;
+            *)
+              echo "FAIL: active xcode-select target is outside an Xcode app: ${active_developer}" >&2
+              exit 1
+              ;;
+          esac
+          cache=/Library/Developer/CoreSimulator/Caches
+          if test -e "${cache}" || test -L "${cache}"; then
+            test -d "${cache}" && test ! -L "${cache}" || {
+              echo 'FAIL: CoreSimulator cache target is not a real directory' >&2
+              exit 1
+            }
+            test "$(cd -P /Library/Developer/CoreSimulator && pwd)/Caches" = "${cache}" || {
+              echo 'FAIL: CoreSimulator cache target did not resolve exactly' >&2
+              exit 1
+            }
+            sudo /bin/rm -rf -- "${cache}"
+          fi
+          test "$(xcode-select -p)" = "${active_developer}"
+          xcrun --find clang
+
+      - name: Reset verifier-owned native state from a prior interrupted run
+        run: |
+          set -euo pipefail
+          python3 packaging/verify_macos_installed_runtime.py \
+            --cleanup-only \
+            --expected-arch arm64 \
+            --repo-root "${GITHUB_WORKSPACE:?}"
+
+      - name: Require dedicated macOS release-runner capacity
+        run: |
+          set -euo pipefail
+          minimum_kib=$((60 * 1024 * 1024))
+          for path in "${GITHUB_WORKSPACE:?}" "${RUNNER_TEMP:?}" "${HOME:?}" /Applications; do
+            available_kib="$(df -Pk "${path}" | awk 'NR == 2 { print $4 }')"
+            printf '%s\t%s KiB free\n' "${path}" "${available_kib}"
+            if [ "${available_kib}" -lt "${minimum_kib}" ]; then
+              echo "FAIL: ${path} has less than the required 60 GiB free for exact-nine release media" >&2
+              exit 1
+            fi
+          done
+          printf 'Physical memory: %s bytes\n' "$(sysctl -n hw.memsize)"
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - uses: ./.github/actions/vendor-ffmpeg
+        with:
+          platform: darwin-arm64
+
+      - name: Build and sign the native application
+        env:
+          HKA_ALLOW_UNPATCHED: ''
+          HKA_BUNDLE_FFMPEG: '1'
+          HKA_BUNDLE_LLAMA: '1'
+          HKA_CODESIGN_IDENTITY: ''
+        run: |
+          chmod +x packaging/build_macos.sh
+          ./packaging/build_macos.sh \
+            --no-dmg \
+            --no-venv \
+            --arch arm64
+
+      - name: Purge rebuildable files before release-media assembly
+        run: |
+          set -euo pipefail
+          test -d 'dist/HKA Desktop.app' || {
+            echo 'FAIL: native application was not produced before custody staging' >&2
+            exit 1
+          }
+          rm -rf -- "${GITHUB_WORKSPACE:?}/build"
+          python3 -m pip cache purge || true
+
+      - name: Recheck space for custody plus the installed exact-nine cache
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, shutil
+          model_bytes = int(os.environ["HKA_CI_OFFLINE_BUNDLE_MODEL_BYTES"])
+          required = 3 * model_bytes + 8 * 1024**3
+          paths = {
+              "workspace": os.environ["GITHUB_WORKSPACE"],
+              "temporary": os.environ["RUNNER_TEMP"],
+              "installed-model cache": os.path.expanduser("~"),
+              "application install": "/Applications",
+          }
+          for subject, path in paths.items():
+              free = shutil.disk_usage(path).free
+              print(f"Free bytes on {subject} volume after app build: {free}; required: {required}")
+              if free < required:
+                  raise SystemExit(f"macOS {subject} volume has insufficient space for the complete exact-nine install")
+          PY
+
+      - id: model_custody
+        name: Download and fully verify exact nine-pack private custody
+        env:
+          GH_TOKEN: ${{ secrets.HKA_SOURCE_TOKEN }}
+        run: |
+          set -euo pipefail
+          BUNDLE_ROOT="${GITHUB_WORKSPACE:?}/dist/HKA-Desktop-macOS-arm64-Offline-Media/HKA Offline Model Media"
+          BUNDLE_INDEX="${BUNDLE_ROOT}/${HKA_CI_OFFLINE_BUNDLE_INDEX_NAME}"
+          test ! -e "${BUNDLE_ROOT}" || { echo 'FAIL: custody path already exists' >&2; exit 1; }
+          mkdir -p "${BUNDLE_ROOT}"
+
+          gh repo view "${SOURCE_REPOSITORY}" --json isPrivate --jq '.isPrivate' | grep -qx true || {
+            echo 'FAIL: model custody is allowed only from a private repository' >&2
+            exit 1
+          }
+          gh release view "${HKA_CI_OFFLINE_BUNDLE_RELEASE_TAG}" --repo "${SOURCE_REPOSITORY}" \
+            --json assets,isDraft,isPrerelease,tagName > "${RUNNER_TEMP:?}/custody-release.json"
+          python3 - "${RUNNER_TEMP}/custody-release.json" <<'PY'
+          import json, os, pathlib, sys
+          value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          expected_files = int(os.environ["HKA_CI_OFFLINE_BUNDLE_FILE_COUNT"])
+          if value.get("tagName") != os.environ["HKA_CI_OFFLINE_BUNDLE_RELEASE_TAG"]:
+              raise SystemExit("private custody release resolved to the wrong tag")
+          if value.get("isDraft") is not False or value.get("isPrerelease") is not True:
+              raise SystemExit("model custody must be a prerelease in the private repository")
+          assets = value.get("assets")
+          if not isinstance(assets, list):
+              raise SystemExit("private custody release asset metadata is unavailable")
+          allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
+          names = []
+          for asset in assets:
+              name, size, state = asset.get("name"), asset.get("size"), asset.get("state")
+              if (
+                  not isinstance(name, str) or not name or any(c not in allowed for c in name)
+                  or not isinstance(size, int) or not 0 < size < 2 * 1024 * 1024 * 1024
+                  or state != "uploaded"
+              ):
+                  raise SystemExit("private custody release has an unsafe or incomplete asset")
+              names.append(name)
+          if len(names) != expected_files or len(set(names)) != expected_files:
+              raise SystemExit(f"private custody release must expose exactly {expected_files} unique assets")
+          PY
+          rm -f -- "${RUNNER_TEMP}/custody-release.json"
+
+          gh release download "${HKA_CI_OFFLINE_BUNDLE_RELEASE_TAG}" \
+            --repo "${SOURCE_REPOSITORY}" --dir "${BUNDLE_ROOT}"
+
+          HKA_CUSTODY_BUNDLE_ROOT="${BUNDLE_ROOT}" HKA_CUSTODY_BUNDLE_INDEX="${BUNDLE_INDEX}" python3 - <<'PY'
+          import hashlib, json, os, stat
+          from pathlib import Path
+          expected_ids = {
+              "opencv-face-privacy-v1", "whisper-large-v3-turbo", "rapidocr-ppocrv6-small",
+              "qwen3-vl-4b-instruct-q4", "gemma-4-e4b-it-q4", "siglip2-base-patch16-224",
+              "efficientat-dymn20-audioset", "laion-clap-htsat-unfused", "pyannote-community-1",
+          }
+          expected_file_count = int(os.environ["HKA_CI_OFFLINE_BUNDLE_FILE_COUNT"])
+          expected_pack_count = int(os.environ["HKA_CI_OFFLINE_BUNDLE_PACK_COUNT"])
+          expected_model_bytes = int(os.environ["HKA_CI_OFFLINE_BUNDLE_MODEL_BYTES"])
+          root = Path(os.environ["HKA_CUSTODY_BUNDLE_ROOT"]).resolve(strict=True)
+          index_path = Path(os.environ["HKA_CUSTODY_BUNDLE_INDEX"])
+          files = list(root.iterdir())
+          if len(files) != expected_file_count:
+              raise SystemExit(f"custody download has {len(files)} files, expected {expected_file_count}")
+          for path in files:
+              if path.is_symlink() or not stat.S_ISREG(path.lstat().st_mode):
+                  raise SystemExit("custody download contains a linked or non-regular entry")
+          if not index_path.is_file() or index_path.is_symlink():
+              raise SystemExit("selected custody index is unavailable or linked")
+          if hashlib.sha256(index_path.read_bytes()).hexdigest() != os.environ["HKA_CI_OFFLINE_BUNDLE_INDEX_SHA256"]:
+              raise SystemExit("selected custody index failed its reviewed SHA-256")
+
+          def strict_object(pairs):
+              value = {}
+              for key, item in pairs:
+                  if key in value:
+                      raise ValueError(f"duplicate JSON key: {key}")
+                  value[key] = item
+              return value
+
+          index = json.loads(index_path.read_text(encoding="utf-8"), object_pairs_hook=strict_object)
+          entries = index.get("packs") if isinstance(index, dict) else None
+          ids = [e.get("pack_id") for e in entries if isinstance(e, dict)] if isinstance(entries, list) else []
+          if index.get("format") != "hka-offline-model-bundle/1" or len(ids) != expected_pack_count or set(ids) != expected_ids or ids != sorted(ids):
+              raise SystemExit("selected custody index is not the exact sorted nine-pack")
+          catalog = json.loads(Path("assets/local_models.json").read_text(encoding="utf-8"), object_pairs_hook=strict_object)
+          packs = catalog.get("packs") if isinstance(catalog, dict) else None
+          catalog_ids = {p.get("id") for p in packs if isinstance(p, dict)} if isinstance(packs, list) else set()
+          model_bytes = sum(a["size_bytes"] for p in (packs or []) for a in p["artifacts"])
+          if catalog.get("catalog_revision") != 9 or len(packs or []) != expected_pack_count or catalog_ids != expected_ids or model_bytes != expected_model_bytes:
+              raise SystemExit("application catalog is not the reviewed revision-9 nine-pack")
+          PY
+
+          MARKER="$(python3 tools/build_offline_model_bundle.py \
+            --catalog assets/local_models.json \
+            --verify-only "${BUNDLE_INDEX}")"
+          HKA_CUSTODY_VERIFY_JSON="${MARKER}" python3 - <<'PY'
+          import json, os
+          marker = json.loads(os.environ["HKA_CUSTODY_VERIFY_JSON"])
+          if (
+              marker.get("pack_count") != int(os.environ["HKA_CI_OFFLINE_BUNDLE_PACK_COUNT"])
+              or marker.get("model_bytes") != int(os.environ["HKA_CI_OFFLINE_BUNDLE_MODEL_BYTES"])
+          ):
+              raise SystemExit("full custody verifier returned the wrong nine-pack totals")
+          print(json.dumps(marker, ensure_ascii=True, sort_keys=True))
+          PY
+          echo "bundle-index=${BUNDLE_INDEX}" >> "${GITHUB_OUTPUT}"
+
+      - name: Build the signed installer and payload as one deterministic DMG
+        env:
+          HKA_ALLOW_UNPATCHED: ''
+          HKA_CODESIGN_IDENTITY: ''
+        run: |
+          set -euo pipefail
+          ./packaging/build_macos.sh \
+            --package-existing-app \
+            --arch arm64 \
+            --offline-model-bundle-index "${{ steps.model_custody.outputs.bundle-index }}" \
+            --defer-release-media-finalization
+          DMG="${GITHUB_WORKSPACE}/dist/HKA-Desktop-macOS-arm64-Offline-Media/HKA-Desktop-macOS-arm64.dmg"
+          test -f "${DMG}" && test ! -L "${DMG}" || {
+            echo 'FAIL: deterministic one-DMG release envelope was not produced safely' >&2
+            exit 1
+          }
+          test "$(stat -f '%z' "${DMG}")" -gt $((2 * 1024 * 1024 * 1024)) || {
+            echo 'FAIL: embedded-model macOS DMG unexpectedly fits below 2 GiB' >&2
+            exit 1
+          }
+
+      - name: Write final manifest only after the DMG trust bytes settle
+        run: |
+          set -euo pipefail
+          MEDIA_ROOT="${GITHUB_WORKSPACE}/dist/HKA-Desktop-macOS-arm64-Offline-Media"
+          python3 packaging/macos_release_media.py \
+            --release-root "${MEDIA_ROOT}" \
+            --dmg "${MEDIA_ROOT}/HKA-Desktop-macOS-arm64.dmg" \
+            --bundle-index "${{ steps.model_custody.outputs.bundle-index }}" \
+            --catalog assets/local_models.json \
+            --arch arm64
+
+      - name: Verify installed exact-nine local models and full native runtime
+        if: ${{ inputs.run_verifier }}
+        env:
+          HKA_CI_TOGETHER_API_KEY: ${{ secrets.TOGETHER_API_KEY }}
+        run: |
+          set -euo pipefail
+          VERIFY_ARGS=(
+            --media-root "${GITHUB_WORKSPACE}/dist/HKA-Desktop-macOS-arm64-Offline-Media"
+            --expected-arch arm64
+            --repo-root "${GITHUB_WORKSPACE}"
+          )
+          if [ -n "${HKA_CI_TOGETHER_API_KEY:-}" ]; then
+            echo "Live-provider smoke enabled for this macOS installed-runtime gate."
+            VERIFY_ARGS+=(--live-provider-smoke)
+          else
+            echo '::notice::Live-provider smoke skipped: TOGETHER_API_KEY is not configured; exact-nine local, GUI, and Keychain gates remain mandatory.'
+          fi
+          python3 packaging/verify_macos_installed_runtime.py "${VERIFY_ARGS[@]}"
+
+      - id: macos_release_identity
+        name: Capture the just-built embedded-DMG identity
+        if: ${{ inputs.publish }}
+        run: |
+          set -euo pipefail
+          MEDIA_ROOT="dist/HKA-Desktop-macOS-arm64-Offline-Media"
+          DMG="${MEDIA_ROOT}/HKA-Desktop-macOS-arm64.dmg"
+          MANIFEST="${MEDIA_ROOT}/HKA macOS Release Media.json"
+          test -f "${DMG}" && test ! -L "${DMG}"
+          test -f "${MANIFEST}" && test ! -L "${MANIFEST}"
+          python3 - "${MANIFEST}" "${DMG}" "${GITHUB_OUTPUT}" <<'PY'
+          import json, os, pathlib, re, stat, sys
+          manifest_path, dmg_path, output_path = map(pathlib.Path, sys.argv[1:])
+          info = os.lstat(dmg_path)
+          manifest = json.loads(manifest_path.read_text(encoding="ascii"))
+          dmg_sha = manifest.get("dmg_sha256")
+          dmg_size = manifest.get("dmg_size_bytes")
+          model_index_sha = manifest.get("bundle_index_sha256")
+          model_bytes = manifest.get("total_model_bytes")
+          pack_count = manifest.get("pack_count")
+          if (
+              manifest.get("schema") != "hka-macos-release-media/2"
+              or manifest.get("architecture") != "arm64"
+              or manifest.get("dmg") != "HKA-Desktop-macOS-arm64.dmg"
+              or not stat.S_ISREG(info.st_mode)
+              or info.st_nlink != 1
+              or type(dmg_size) is not int
+              or info.st_size != dmg_size
+              or dmg_size <= 2 * 1024**3
+              or re.fullmatch(r"[0-9a-f]{64}", str(dmg_sha)) is None
+              or model_index_sha != "37ff23fdfba4134f535ae178b57201ee6281ced9b363877f65e8d237f4161b93"
+              or model_bytes != 12_147_240_319
+              or pack_count != 9
+          ):
+              raise SystemExit("manifest does not identify the exact embedded-model DMG")
+          with output_path.open("a", encoding="utf-8") as handle:
+              handle.write(f"dmg_sha256={dmg_sha}\n")
+              handle.write(f"dmg_size_bytes={dmg_size}\n")
+              handle.write(f"model_index_sha256={model_index_sha}\n")
+              handle.write(f"model_bytes={model_bytes}\n")
+              handle.write(f"pack_count={pack_count}\n")
+          PY
+
+      - name: Configure short-lived AWS credentials for private publication
+        if: ${{ inputs.publish }}
+        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
+        with:
+          role-to-assume: ${{ env.HKA_RELEASE_AWS_ROLE_ARN }}
+          role-session-name: hka-${{ github.run_id }}-${{ github.run_attempt }}
+          aws-region: ${{ env.HKA_RELEASE_AWS_REGION }}
+          allowed-account-ids: ${{ env.HKA_RELEASE_AWS_ACCOUNT_ID }}
+          mask-aws-account-id: true
+          unset-current-credentials: true
+
+      - name: Publish the embedded-model DMG and its receipt directly to private S3
+        if: ${{ inputs.publish }}
+        env:
+          APP_VERSION: ${{ steps.source.outputs.app_version }}
+          DMG_SHA256: ${{ steps.macos_release_identity.outputs.dmg_sha256 }}
+          DMG_SIZE_BYTES: ${{ steps.macos_release_identity.outputs.dmg_size_bytes }}
+          MODEL_INDEX_SHA256: ${{ steps.macos_release_identity.outputs.model_index_sha256 }}
+          MODEL_BYTES: ${{ steps.macos_release_identity.outputs.model_bytes }}
+          PACK_COUNT: ${{ steps.macos_release_identity.outputs.pack_count }}
+        run: |
+          set -euo pipefail
+          command -v aws >/dev/null
+          MEDIA_ROOT="dist/HKA-Desktop-macOS-arm64-Offline-Media"
+          DMG="${MEDIA_ROOT}/HKA-Desktop-macOS-arm64.dmg"
+          RECEIPT="${RUNNER_TEMP:?}/HKA-macOS-private-S3-object.json"
+          OBJECT_KEY="macos/releases/${APP_VERSION}/${SOURCE_SHA}/${DMG_SHA256}/HKA-Desktop-macOS-arm64.dmg"
+          RECEIPT_KEY="macos/releases/${APP_VERSION}/${SOURCE_SHA}/${DMG_SHA256}/HKA-macOS-private-S3-object.json"
+          export DMG_SHA256 DMG_SIZE_BYTES MODEL_INDEX_SHA256 MODEL_BYTES PACK_COUNT OBJECT_KEY
+
+          CALLER_ACCOUNT="$(aws sts get-caller-identity --query Account --output text --no-cli-pager)"
+          test "${CALLER_ACCOUNT}" = "${HKA_RELEASE_AWS_ACCOUNT_ID}" || {
+            echo 'FAIL: OIDC credentials belong to the wrong AWS account' >&2
+            exit 1
+          }
+
+          LISTING="$(mktemp "${RUNNER_TEMP}/hka-s3-list.XXXXXX")"
+          HEAD_JSON="$(mktemp "${RUNNER_TEMP}/hka-s3-head.XXXXXX")"
+          aws s3api list-objects-v2 \
+            --bucket "${HKA_RELEASE_S3_BUCKET}" \
+            --prefix "${OBJECT_KEY}" \
+            --max-keys 1 \
+            --expected-bucket-owner "${HKA_RELEASE_AWS_ACCOUNT_ID}" \
+            --output json \
+            --no-cli-pager > "${LISTING}"
+          if LISTING="${LISTING}" python3 - <<'PY'
+          import json, os, sys
+          value = json.load(open(os.environ["LISTING"], encoding="utf-8"))
+          key = os.environ["OBJECT_KEY"]
+          sys.exit(0 if any(item.get("Key") == key for item in value.get("Contents", [])) else 1)
+          PY
+          then
+            echo 'Immutable S3 object already exists; verifying it without overwriting.'
+          else
+            aws s3 cp "${DMG}" "s3://${HKA_RELEASE_S3_BUCKET}/${OBJECT_KEY}" \
+              --only-show-errors \
+              --checksum-algorithm SHA256 \
+              --content-type application/x-apple-diskimage \
+              --content-disposition 'attachment; filename="HKA-Desktop-macOS-arm64.dmg"' \
+              --server-side-encryption AES256 \
+              --metadata "dmg-sha256=${DMG_SHA256},dmg-size-bytes=${DMG_SIZE_BYTES},git-sha=${SOURCE_SHA},app-version=${APP_VERSION},model-index-sha256=${MODEL_INDEX_SHA256},model-bytes=${MODEL_BYTES},pack-count=${PACK_COUNT}" \
+              --expected-bucket-owner "${HKA_RELEASE_AWS_ACCOUNT_ID}" \
+              --no-cli-pager
+          fi
+
+          aws s3api head-object \
+            --bucket "${HKA_RELEASE_S3_BUCKET}" \
+            --key "${OBJECT_KEY}" \
+            --expected-bucket-owner "${HKA_RELEASE_AWS_ACCOUNT_ID}" \
+            --checksum-mode ENABLED \
+            --output json \
+            --no-cli-pager > "${HEAD_JSON}"
+          HEAD_JSON="${HEAD_JSON}" RECEIPT="${RECEIPT}" python3 - <<'PY'
+          import json, os, pathlib, re
+          head = json.load(open(os.environ["HEAD_JSON"], encoding="utf-8"))
+          metadata = head.get("Metadata")
+          expected_metadata = {
+              "dmg-sha256": os.environ["DMG_SHA256"],
+              "dmg-size-bytes": os.environ["DMG_SIZE_BYTES"],
+              "git-sha": os.environ["SOURCE_SHA"],
+              "app-version": os.environ["APP_VERSION"],
+              "model-index-sha256": os.environ["MODEL_INDEX_SHA256"],
+              "model-bytes": os.environ["MODEL_BYTES"],
+              "pack-count": os.environ["PACK_COUNT"],
+          }
+          checksum = head.get("ChecksumSHA256")
+          checksum_type = head.get("ChecksumType")
+          version_id = head.get("VersionId")
+          if (
+              head.get("ContentLength") != int(os.environ["DMG_SIZE_BYTES"])
+              or head.get("ContentType") != "application/x-apple-diskimage"
+              or head.get("ContentDisposition") != 'attachment; filename="HKA-Desktop-macOS-arm64.dmg"'
+              or head.get("ServerSideEncryption") != "AES256"
+              or metadata != expected_metadata
+              or not isinstance(checksum, str) or not checksum
+              or checksum_type not in {"COMPOSITE", "FULL_OBJECT"}
+              or not isinstance(version_id, str) or not version_id
+              or re.fullmatch(r"[0-9a-f]{40}", os.environ["SOURCE_SHA"]) is None
+          ):
+              raise SystemExit("private S3 object failed post-upload HEAD verification")
+          receipt = {
+              "schema": "hka-private-macos-s3-object/1",
+              "aws_account_id": os.environ["HKA_RELEASE_AWS_ACCOUNT_ID"],
+              "aws_region": os.environ["HKA_RELEASE_AWS_REGION"],
+              "bucket": os.environ["HKA_RELEASE_S3_BUCKET"],
+              "key": os.environ["OBJECT_KEY"],
+              "version_id": version_id,
+              "content_length": head["ContentLength"],
+              "content_type": head["ContentType"],
+              "content_disposition": head["ContentDisposition"],
+              "server_side_encryption": head["ServerSideEncryption"],
+              "s3_checksum_sha256": checksum,
+              "s3_checksum_type": checksum_type,
+              "dmg_sha256": os.environ["DMG_SHA256"],
+              "source_git_sha": os.environ["SOURCE_SHA"],
+              "app_version": os.environ["APP_VERSION"],
+              "model_index_sha256": os.environ["MODEL_INDEX_SHA256"],
+              "model_bytes": int(os.environ["MODEL_BYTES"]),
+              "pack_count": int(os.environ["PACK_COUNT"]),
+              "github_repository": os.environ["GITHUB_REPOSITORY"],
+              "github_run_id": os.environ["GITHUB_RUN_ID"],
+              "github_run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "last_modified": head["LastModified"],
+          }
+          pathlib.Path(os.environ["RECEIPT"]).write_text(
+              json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+          )
+          PY
+          # The receipt is private too: it goes beside the DMG in the bucket,
+          # never into a public artifact.
+          aws s3 cp "${RECEIPT}" "s3://${HKA_RELEASE_S3_BUCKET}/${RECEIPT_KEY}" \
+            --only-show-errors \
+            --content-type application/json \
+            --server-side-encryption AES256 \
+            --expected-bucket-owner "${HKA_RELEASE_AWS_ACCOUNT_ID}" \
+            --no-cli-pager
+          rm -f -- "${LISTING}" "${HEAD_JSON}" "${RECEIPT}"
+          echo "Private S3 publication verified for immutable source ${SOURCE_SHA}."
+          echo "Receipt key: ${RECEIPT_KEY}"
+
+      - name: Remove verifier-owned installed app and model cache
+        if: always()
+        run: |
+          set -euo pipefail
+          python3 packaging/verify_macos_installed_runtime.py \
+            --cleanup-only \
+            --expected-arch arm64 \
+            --repo-root "${GITHUB_WORKSPACE:?}"
+
+      - name: Remove staged macOS custody from the runner
+        if: always()
+        run: |
+          set -euo pipefail
+          TARGET="${GITHUB_WORKSPACE:?}/dist/HKA-Desktop-macOS-arm64-Offline-Media"
+          if [ -e "${TARGET}" ] && [ ! -L "${TARGET}" ]; then
+            rm -rf -- "${TARGET}"
+          fi
