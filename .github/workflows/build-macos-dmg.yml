@@ -486,9 +486,8 @@ jobs:
               --checksum-algorithm SHA256 \
               --content-type application/x-apple-diskimage \
               --content-disposition 'attachment; filename="HKA-Desktop-macOS-arm64.dmg"' \
-              --server-side-encryption AES256 \
+              --sse AES256 \
               --metadata "dmg-sha256=${DMG_SHA256},dmg-size-bytes=${DMG_SIZE_BYTES},git-sha=${SOURCE_SHA},app-version=${APP_VERSION},model-index-sha256=${MODEL_INDEX_SHA256},model-bytes=${MODEL_BYTES},pack-count=${PACK_COUNT}" \
-              --expected-bucket-owner "${HKA_RELEASE_AWS_ACCOUNT_ID}" \
               --no-cli-pager
           fi
 
@@ -560,8 +559,7 @@ jobs:
           aws s3 cp "${RECEIPT}" "s3://${HKA_RELEASE_S3_BUCKET}/${RECEIPT_KEY}" \
             --only-show-errors \
             --content-type application/json \
-            --server-side-encryption AES256 \
-            --expected-bucket-owner "${HKA_RELEASE_AWS_ACCOUNT_ID}" \
+            --sse AES256 \
             --no-cli-pager
           rm -f -- "${LISTING}" "${HEAD_JSON}" "${RECEIPT}"
           echo "Private S3 publication verified for immutable source ${SOURCE_SHA}."
