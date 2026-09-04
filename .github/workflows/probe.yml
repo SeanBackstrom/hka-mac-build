@@ -1,0 +1,24 @@
+name: Runner probe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - run: echo "linux runner started"
+
+  macos:
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - run: |
+          sw_vers
+          uname -m
+          sysctl -n hw.memsize
+          df -Pk "$HOME" | awk 'NR == 2 { print $4 " KiB free" }'
